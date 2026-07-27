@@ -16,9 +16,11 @@
 	<true/>
 	<key>com.apple.security.personal-information.photos-library</key>
 	<true/>
-    <key>com.apple.security.application-groups</key>
-    <array>
-    <string>2BBY89MBSN.dev.warp</string>
-    </array>
+	<!-- The App Group entitlement that used to live here was hard-coded to the
+	     upstream Warp team (2BBY89MBSN.dev.warp) and cannot be claimed by a
+	     different signing identity. It was also dead weight: `secure_state_dir`
+	     in crates/warp_core/src/paths.rs returns None for the oss channel before
+	     it ever looks at the group container. Re-add it, with a matching
+	     provisioning profile, only if a channel starts using the container. -->
 </dict>
 </plist>

@@ -272,7 +272,11 @@ pub fn app_group_container_path() -> Option<PathBuf> {
         use objc2_foundation::{NSFileManager, NSString};
 
         let fm = NSFileManager::defaultManager();
-        // Keep in sync with Entitlements.plist
+        // Keep in sync with Entitlements.plist, which currently declares no App
+        // Group at all — without a matching entitlement the container below is
+        // not writable and this resolves to None. Only the oss channel is built
+        // from this repo, and `secure_state_dir` bails out for it before getting
+        // here, so nothing depends on the container today.
         let group_id = format!("{}.dev.warp", crate::macos::APPLE_TEAM_ID);
         let group_id = NSString::from_str(&group_id);
         // containerURLForSecurityApplicationGroupIdentifier always returns a value on macOS (unlike iOS).

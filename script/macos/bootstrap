@@ -2,8 +2,27 @@
 #
 # Run this script once to prepare your machine to develop Warp. This script is
 # a work in progress, and may be incomplete.
+#
+# Pass --build-only to set up a machine that only has to produce release
+# bundles (see docs/build-macos.md). That mode skips the test harness and the
+# tooling that exists for cross-platform linting and Warp-internal services:
+# PowerShell, Docker and gcloud, the last of which otherwise blocks on an
+# interactive login prompt.
 
 set -e
+
+BUILD_ONLY=false
+for arg in "$@"; do
+    case "$arg" in
+        --build-only)
+            BUILD_ONLY=true
+            ;;
+        *)
+            echo "Unknown option: $arg" >&2
+            exit 1
+            ;;
+    esac
+done
 
 if ! [ -d "/Applications/Xcode.app" ]; then
     echo "Please install Xcode from the App Store before continuing."
@@ -30,7 +49,9 @@ if ! command -v cargo; then
 fi
 
 # Install various binaries through cargo.
-"$PWD"/script/install_cargo_test_deps
+if [ "$BUILD_ONLY" = false ]; then
+    "$PWD"/script/install_cargo_test_deps
+fi
 "$PWD"/script/install_cargo_release_deps
 
 # Install a version of cargo-bundle that supports the --profile flag
@@ -40,28 +61,31 @@ cargo install cargo-bundle --git=https://github.com/burtonageo/cargo-bundle --re
 brew update
 
 brew install jq
-brew install clang-format
 brew install create-dmg
-brew install multitime
-brew install powershell
 brew install pkgconf
 brew install llvm
 
-# Install PSScriptAnalyzer for PowerShell linting
-pwsh -Command "Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser"
+if [ "$BUILD_ONLY" = false ]; then
+    brew install clang-format
+    brew install multitime
+    brew install powershell
 
-if ! [ "$(command -v docker)" ]; then
-    brew install --cask docker
-fi
+    # Install PSScriptAnalyzer for PowerShell linting
+    pwsh -Command "Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser"
 
-if ! [ "$(command -v gcloud)" ]; then
-    brew install google-cloud-sdk
-fi
+    if ! [ "$(command -v docker)" ]; then
+        brew install --cask docker
+    fi
 
-if [[ -z $(gcloud auth print-identity-token) ]]; then
-    echo "gcloud CLI authentication missing.  Press enter to continue..."
-    read var
-    gcloud auth login
+    if ! [ "$(command -v gcloud)" ]; then
+        brew install google-cloud-sdk
+    fi
+
+    if [ -z "$(gcloud auth print-identity-token)" ]; then
+        echo "gcloud CLI authentication missing.  Press enter to continue..."
+        read var
+        gcloud auth login
+    fi
 fi
 
 # Needed for building for Mac ARM machines (e.g. M1)

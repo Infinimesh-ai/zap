@@ -24,14 +24,32 @@
 #
 # Once the stapling is done, the app can be shared.
 #
-# Three passwords are read from GCP Secret Manager (or from env if --read-passwords-from-env is set) if you are codesigning.
-# 1) WARP_NOTARIZATION_PASSWORD:  This is an "app-specific password" that
-#    is tied to the zach@warp.dev account.  See https://support.apple.com/en-us/HT204397
-# 2) WARP_DEVELOPER_ID_CERT_PASSWORD: This is a password tied to the private key
-#    of our cert - it is needed to use the cert to sign our binary.
-# 3) WARP_CODESIGN_KEYCHAIN_PASSWORD: This is an arbitrary password only used
-#    in the lifetime of this app for creating the keychain used to sign.  Can
-#    be anything.
+# There are three ways to sign, from least to most involved:
+#
+# a) --selfsign
+#    Ad-hoc signature, or a local "Apple Development" certificate if one exists.
+#    Enough for the app to have a cdhash (required for notification registration),
+#    not enough to distribute: Gatekeeper still shows the unidentified-developer
+#    dialog. This is what CI uses.
+#
+# b) --localsign [identity] [--notarize]
+#    Signs with a "Developer ID Application" certificate that is already in the
+#    local keychain — the path to use on a build Mac that holds the company cert.
+#    The Team ID is derived from the certificate, or taken from $APPLE_TEAM_ID.
+#    Notarization credentials come from a `notarytool store-credentials` keychain
+#    profile named by $ZAP_NOTARY_KEYCHAIN_PROFILE, falling back to the Apple ID
+#    environment variables below.
+#
+# c) --read-passwords-from-env --notarize
+#    For CI: imports a base64-encoded .p12 into a throwaway keychain. Requires
+#    $APPLE_TEAM_ID plus these environment variables:
+#    1) WARP_DEVELOPER_ID_CERT: base64 of the Developer ID Application .p12.
+#    2) WARP_DEVELOPER_ID_CERT_PASSWORD: password protecting that .p12.
+#    3) WARP_CODESIGN_KEYCHAIN_PASSWORD: arbitrary password, only used for the
+#       lifetime of the temporary keychain.
+#    4) WARP_NOTARIZATION_APPLE_ID: Apple ID used to submit for notarization.
+#    5) WARP_NOTARIZATION_PASSWORD: an "app-specific password" for that Apple ID.
+#       See https://support.apple.com/en-us/HT204397
 #
 # See
 # https://github.com/burtonageo/cargo-bundle
@@ -115,6 +133,9 @@ DEBUG=false
 ARTIFACT="app"
 CODESIGN=true
 SELFSIGN=false
+LOCALSIGN=false
+SIGNING_IDENTITY=""
+NOTARIZE=false
 OPEN_AFTER_BUNDLE=false
 READ_PASSWORDS_FROM_ENV=false
 
@@ -153,6 +174,29 @@ while (( "$#" )); do
       echo "Self-signing enabled."
       CODESIGN=false
       SELFSIGN=true
+      shift
+      ;;
+    # Sign with a "Developer ID Application" certificate that is already installed
+    # in the local keychain — no p12 import, no temporary keychain, no GCP/env
+    # secrets. This is the path to use on a company Mac that holds the signing
+    # cert. An identity (certificate name or SHA-1 fingerprint) may be passed
+    # explicitly; otherwise it is auto-detected, optionally narrowed by the
+    # APPLE_TEAM_ID environment variable.
+    --localsign)
+      CODESIGN=false
+      SELFSIGN=false
+      LOCALSIGN=true
+      if [ -n "$2" ] && [ "${2:0:1}" != "-" ]; then
+        SIGNING_IDENTITY=$2
+        shift 2
+      else
+        shift
+      fi
+      ;;
+    # Submit the signed artifact to Apple for notarization and staple the ticket.
+    # Requires a Developer ID signature (--localsign or --read-passwords-from-env).
+    --notarize)
+      NOTARIZE=true
       shift
       ;;
     # Build only for the default target architecture instead of universal binary
@@ -253,6 +297,91 @@ done
 # set positional arguments in their proper place
 eval set -- "$PARAMS"
 
+##############################################
+## Step 0: Resolve the code-signing identity ##
+##############################################
+#
+# This runs *before* the build for two reasons:
+#
+# 1. A missing/ambiguous certificate fails in seconds instead of after a
+#    40+ minute release-lto build.
+# 2. The resolved Team ID is handed to `cargo build` through ZAP_APPLE_TEAM_ID,
+#    where `warp_core::macos::APPLE_TEAM_ID` picks it up via `option_env!`.
+#    The Rust constant has to match the certificate the bundle is signed with,
+#    otherwise autoupdate's `verify_code_signature` rejects our own builds.
+
+# Team ID of the upstream Warp project. Only used as a fallback so that builds
+# without an explicit APPLE_TEAM_ID keep behaving exactly like before.
+UPSTREAM_APPLE_TEAM_ID="2BBY89MBSN"
+APPLE_TEAM_ID="${APPLE_TEAM_ID:-}"
+
+if [[ $NOTARIZE = true && $LOCALSIGN != true && $READ_PASSWORDS_FROM_ENV != true ]]; then
+  echo "Error: --notarize requires a Developer ID signature; pass --localsign or --read-passwords-from-env." >&2
+  exit 1
+fi
+
+if [[ $LOCALSIGN = true && "$CHECK_ONLY" != "true" ]]; then
+  if [[ -z "$SIGNING_IDENTITY" ]]; then
+    # `security find-identity` prints lines shaped like:
+    #   1) A1B2C3...  "Developer ID Application: Acme Inc (ABCDE12345)"
+    IDENTITY_LINES="$(security find-identity -v -p codesigning | grep "Developer ID Application" || true)"
+    if [[ -n "$APPLE_TEAM_ID" ]]; then
+      IDENTITY_LINES="$(echo "$IDENTITY_LINES" | grep "($APPLE_TEAM_ID)" || true)"
+    fi
+    IDENTITY_COUNT="$(echo "$IDENTITY_LINES" | grep -c . || true)"
+
+    if [[ "$IDENTITY_COUNT" -eq 0 ]]; then
+      echo "Error: no \"Developer ID Application\" certificate found in the keychain${APPLE_TEAM_ID:+ for team $APPLE_TEAM_ID}." >&2
+      echo "       Install the company signing certificate (Keychain Access > import the .p12)," >&2
+      echo "       or use --selfsign for an ad-hoc/development build." >&2
+      echo "       Available codesigning identities:" >&2
+      security find-identity -v -p codesigning >&2 || true
+      exit 1
+    fi
+
+    if [[ "$IDENTITY_COUNT" -gt 1 ]]; then
+      echo "Error: multiple Developer ID Application certificates found. Narrow the selection with" >&2
+      echo "       APPLE_TEAM_ID=<team> or --localsign \"<certificate name or SHA-1>\":" >&2
+      echo "$IDENTITY_LINES" >&2
+      exit 1
+    fi
+
+    # Prefer the SHA-1 fingerprint over the common name: it is unambiguous even
+    # when an expired certificate with the same name is still in the keychain.
+    SIGNING_IDENTITY="$(echo "$IDENTITY_LINES" | awk '{print $2}')"
+    SIGNING_IDENTITY_NAME="$(echo "$IDENTITY_LINES" | sed -n 's/.*"\(.*\)".*/\1/p')"
+  else
+    SIGNING_IDENTITY_NAME="$SIGNING_IDENTITY"
+  fi
+
+  # Derive the Team ID from the certificate's common name, which ends in
+  # "(TEAMID)", so the caller does not have to look it up by hand.
+  if [[ -z "$APPLE_TEAM_ID" ]]; then
+    APPLE_TEAM_ID="$(echo "$SIGNING_IDENTITY_NAME" | sed -n 's/.*(\([A-Z0-9]\{10\}\))[^)]*$/\1/p')"
+  fi
+  if [[ -z "$APPLE_TEAM_ID" ]]; then
+    echo "Error: could not derive the Apple Team ID from '$SIGNING_IDENTITY_NAME'." >&2
+    echo "       Set it explicitly, e.g. APPLE_TEAM_ID=ABCDE12345 script/bundle ..." >&2
+    exit 1
+  fi
+
+  echo "Signing with '$SIGNING_IDENTITY_NAME' (team $APPLE_TEAM_ID)."
+fi
+
+APPLE_TEAM_ID="${APPLE_TEAM_ID:-$UPSTREAM_APPLE_TEAM_ID}"
+# Consumed by `warp_core::macos::APPLE_TEAM_ID`, which defaults to the same
+# upstream team. Only export the variable when it actually differs: cargo folds
+# `option_env!` inputs into the build fingerprint, so exporting it
+# unconditionally would rebuild warp_core — and every crate above it — whenever
+# a plain `cargo build` alternates with a bundle build on the same profile.
+# The else branch clears a value inherited from the caller's environment, so the
+# constant can never disagree with the certificate we are about to sign with.
+if [[ "$APPLE_TEAM_ID" != "$UPSTREAM_APPLE_TEAM_ID" ]]; then
+  export ZAP_APPLE_TEAM_ID="$APPLE_TEAM_ID"
+else
+  unset ZAP_APPLE_TEAM_ID
+fi
+
 # Infer a cargo profile from the bundle configuration.
 if [[ $DEBUG = true ]]; then
   CARGO_PROFILE="dev"
@@ -347,6 +476,14 @@ else
         ADDITIONAL_TARGET="$INTEL_TARGET"
         BUNDLE_DIR="target/$ARM_TARGET/$TARGET_PROFILE_DIR/bundle/osx"
     fi
+fi
+
+# Make sure the toolchain can build the selected target. CI installs it in a
+# separate step; doing it here means a local `--arch x86_64` build on an Apple
+# Silicon Mac fails immediately instead of deep inside cargo with
+# "can't find crate for `std`".
+if command -v rustup > /dev/null; then
+    rustup target add "$DEFAULT_TARGET"
 fi
 
 # Set artifact-specific configuration.
@@ -623,33 +760,37 @@ fi
 ## Step 2: Create code-signing keychain ##
 ##########################################
 
-if [[ $READ_PASSWORDS_FROM_ENV != true ]]; then
+if [[ $CODESIGN = true && $READ_PASSWORDS_FROM_ENV != true ]]; then
   echo "Skipping code-signing because passwords are not available in environment."
   CODESIGN=false
 fi
 
 if [[ $CODESIGN = true ]]; then
-  # TODO - does this need to change per user?  Seems like it's tied to the WARP_NOTARIZATION_PASSWORD password.
-  APPLE_TEAM_ID="2BBY89MBSN"
   CODESIGN_KEYCHAIN_NAME="warp-codesign-keychain"
+  # The imported certificate is the only identity in the temporary keychain, so
+  # the Team ID is enough to select it.
+  SIGNING_IDENTITY="$APPLE_TEAM_ID"
+  # The CI path has always notarized; keep that implicit.
+  NOTARIZE=true
 
   echo "Starting codesigning..."
 
   if [[ $READ_PASSWORDS_FROM_ENV = true ]]; then
-    if [ -z "$WARP_NOTARIZATION_PASSWORD" ] ; then
-      echo "WARP_NOTARIZATION_PASSWORD must be set for code signing"
-      exit 1
-    fi
-
-    if [ -z "$WARP_DEVELOPER_ID_CERT_PASSWORD" ] ; then
-      echo "WARP_DEVELOPER_ID_CERT_PASSWORD must be set for code signing"
-      exit 1
-    fi
-
-    if [ -z "$WARP_CODESIGN_KEYCHAIN_PASSWORD" ] ; then
-      echo "WARP_CODESIGN_KEYCHAIN_PASSWORD must be set for code signing"
-      exit 1
-    fi
+    # WARP_NOTARIZATION_APPLE_ID is checked here too: it is only consumed by
+    # `notarytool` at the very end of the script, so a missing value used to
+    # surface hours into a release build.
+    for required_var in \
+      WARP_DEVELOPER_ID_CERT \
+      WARP_DEVELOPER_ID_CERT_PASSWORD \
+      WARP_CODESIGN_KEYCHAIN_PASSWORD \
+      WARP_NOTARIZATION_APPLE_ID \
+      WARP_NOTARIZATION_PASSWORD
+    do
+      if [ -z "${!required_var}" ] ; then
+        echo "$required_var must be set for code signing"
+        exit 1
+      fi
+    done
   fi
 
   security delete-keychain $CODESIGN_KEYCHAIN_NAME || echo "No existing keychain to clean up".
@@ -669,7 +810,54 @@ fi
 ## Step 3: Codesign the app ##
 ##############################
 
-if [[ $SELFSIGN = true ]]; then
+# Sign nested code (plug-ins, frameworks, dylibs) before the enclosing .app.
+# Apple no longer recommends `codesign --deep`: it applies the *main* app's
+# entitlements to every nested binary, which notarization flags. `find -depth`
+# walks bottom-up, so inner bundles are always signed before their parents.
+sign_nested_code() {
+  local app_path="$1"
+  local nested
+  while IFS= read -r -d '' nested; do
+    echo "  Signing nested code: ${nested#"$app_path/"}"
+    codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$nested"
+  done < <(find "$app_path/Contents" -depth \
+    \( -name "*.docktileplugin" -o -name "*.framework" -o -name "*.bundle" \
+       -o -name "*.dylib" -o -name "*.so" \) -print0)
+
+  # Anything executable under Helpers/ is a separate Mach-O (e.g. the bundled
+  # pprof helper) and has to carry its own signature.
+  if [[ -d "$app_path/Contents/Helpers" ]]; then
+    while IFS= read -r -d '' nested; do
+      echo "  Signing helper: ${nested#"$app_path/"}"
+      codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$nested"
+    done < <(find "$app_path/Contents/Helpers" -type f -perm -u+x -print0)
+  fi
+}
+
+if [[ $LOCALSIGN = true ]]; then
+  if [[ "$ARTIFACT" == app ]]; then
+    echo "Signing $BUNDLE_DIR/$WARP_APP_NAME.app with '$SIGNING_IDENTITY_NAME'..."
+    sign_nested_code "$BUNDLE_DIR/$WARP_APP_NAME.app"
+    # The production entitlements are used here rather than Debug-Entitlements:
+    # the debug set carries `get-task-allow`, which Apple rejects at notarization.
+    codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" \
+      "$BUNDLE_DIR/$WARP_APP_NAME.app" --entitlements script/Entitlements.plist
+    codesign --verify --strict --verbose=2 "$BUNDLE_DIR/$WARP_APP_NAME.app"
+  elif [[ "$ARTIFACT" == cli ]]; then
+    echo "Signing $OUT_DIR/$WARP_BIN with '$SIGNING_IDENTITY_NAME'..."
+    codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" \
+      "$OUT_DIR/$WARP_BIN" --entitlements script/Entitlements.plist
+
+    # Build the notarization payload outside OUT_DIR so that codesign does not
+    # treat the archive as a sealed resource of the binary it contains.
+    NOTARIZATION_ARTIFACT="$BUNDLE_DIR/${WARP_BIN}_notarize.zip"
+    rm -f "$NOTARIZATION_ARTIFACT"
+    ditto -c -k "$OUT_DIR/$WARP_BIN" "$NOTARIZATION_ARTIFACT"
+
+    # Notarization tickets cannot be stapled to standalone binaries.
+    STAPLE_TICKET=false
+  fi
+elif [[ $SELFSIGN = true ]]; then
   SIGNING_CERT="$(security find-identity -p codesigning -v | grep "Apple Development" | awk '{print $2}' | head -1)"
   if [[ -z "$SIGNING_CERT" ]]; then
     echo "No Apple Development cert found, falling back to ad-hoc signing."
@@ -751,7 +939,7 @@ if [[ "$ARTIFACT" = app ]]; then
 
   # If we're codesigning, stage the signed app and use that to create the DMG.
   # Otherwise, create a DMG from the bundle dir directly.
-  if [[ $CODESIGN = true ]]; then
+  if [[ $CODESIGN = true || $LOCALSIGN = true ]]; then
     if test -d "$DMG_DIR"; then
       echo "Clearing old dmg directory $DMG_DIR"
       rm -r "$DMG_DIR"
@@ -763,7 +951,7 @@ if [[ "$ARTIFACT" = app ]]; then
     create_warp_dmg "$DMG_DIR"
 
     echo "Codesigning $DMG_DIR/$DMG_NAME..."
-    codesign -s "$APPLE_TEAM_ID" --timestamp "$DMG_DIR/$DMG_NAME"
+    codesign -s "$SIGNING_IDENTITY" --timestamp "$DMG_DIR/$DMG_NAME"
 
     NOTARIZATION_ARTIFACT="$DMG_DIR/$DMG_NAME"
     STAPLE_TICKET=true
@@ -782,27 +970,54 @@ fi
 ## Step 5: Notarize the app ##
 ##############################
 
-if [[ $CODESIGN = true ]]; then
+if [[ $NOTARIZE = true ]]; then
+  # Two ways to authenticate with `notarytool`, in order of preference:
+  #
+  # 1. A keychain profile created once per machine with
+  #      xcrun notarytool store-credentials <profile> --apple-id ... --team-id ... --password ...
+  #    Nothing sensitive has to be passed through the environment, so this is
+  #    the right choice on a developer/build Mac.
+  # 2. Apple ID plus app-specific password from the environment, for CI.
+  NOTARY_KEYCHAIN_PROFILE="${ZAP_NOTARY_KEYCHAIN_PROFILE:-}"
+  if [[ -n "$NOTARY_KEYCHAIN_PROFILE" ]]; then
+    NOTARYTOOL_AUTH=(--keychain-profile "$NOTARY_KEYCHAIN_PROFILE")
+  elif [[ -n "${WARP_NOTARIZATION_APPLE_ID:-}" && -n "${WARP_NOTARIZATION_PASSWORD:-}" ]]; then
+    NOTARYTOOL_AUTH=(
+      --apple-id "$WARP_NOTARIZATION_APPLE_ID"
+      --password "$WARP_NOTARIZATION_PASSWORD"
+      --team-id "$APPLE_TEAM_ID"
+    )
+  else
+    echo "Error: no notarization credentials available." >&2
+    echo "       Either store them once with:" >&2
+    echo "         xcrun notarytool store-credentials zap-notary --apple-id <id> --team-id $APPLE_TEAM_ID --password <app-specific-password>" >&2
+    echo "       and re-run with ZAP_NOTARY_KEYCHAIN_PROFILE=zap-notary," >&2
+    echo "       or set WARP_NOTARIZATION_APPLE_ID and WARP_NOTARIZATION_PASSWORD." >&2
+    exit 1
+  fi
+
   echo "Uploading $NOTARIZATION_ARTIFACT to Apple for notarization..."
-  xcrun notarytool submit "$NOTARIZATION_ARTIFACT" --apple-id "$WARP_NOTARIZATION_APPLE_ID" --password "$WARP_NOTARIZATION_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+  # `notarytool submit --wait` exits non-zero unless the submission is accepted,
+  # and `set -e` turns that into a failed build.
+  xcrun notarytool submit "$NOTARIZATION_ARTIFACT" "${NOTARYTOOL_AUTH[@]}" --wait
 
   if [[ $STAPLE_TICKET = true ]]; then
     echo "Attempting to staple the notarization ticket to $NOTARIZATION_ARTIFACT..."
     xcrun stapler staple "$NOTARIZATION_ARTIFACT"
   fi
 
-  if [[ $? != 0 ]]; then
-    echo "Notarization failed; see above output for details."
-    exit 1
-  fi
-
   # Verify the notarization results (this is format-dependent)
   echo "Verifying notarization ticket..."
   if [[ "$ARTIFACT" = app ]]; then
     xcrun stapler validate "$DMG_DIR/$DMG_NAME"
+    spctl -a -t open --context context:primary-signature -vv "$DMG_DIR/$DMG_NAME"
   elif [[ "$ARTIFACT" = cli ]]; then
     spctl -a -t open --context context:primary-signature -vv "$OUT_DIR/$WARP_BIN"
   fi
+elif [[ $LOCALSIGN = true ]]; then
+  echo "Signed with a Developer ID certificate but not notarized."
+  echo "The bundle runs locally as-is; add --notarize before handing the DMG to anyone else,"
+  echo "otherwise Gatekeeper blocks it once the file carries a download quarantine flag."
 fi
 
 
